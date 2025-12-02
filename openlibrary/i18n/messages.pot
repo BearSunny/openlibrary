@@ -5576,10 +5576,13 @@ msgstr ""
 msgid "GitHub"
 msgstr ""
 
+<<<<<<< HEAD
 #: lib/nav_foot.html
 msgid "Open Library on GitHub"
 msgstr ""
 
+=======
+>>>>>>> 9ae838f79 (migrate <style> to static/css)
 #: lib/nav_foot.html site/alert.html
 msgid "Change Website Language"
 msgstr ""
