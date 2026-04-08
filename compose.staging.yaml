@@ -17,6 +17,8 @@ services:
       - OL_CONFIG=/olsystem/etc/openlibrary.yml
       # Note this won't work with uv pip, because uv makes a network request
       - BEFORE_START=pip install -e /booklending_utils
+    env_file:
+      - ./.env.local
     volumes:
       - ../olsystem:/olsystem
       - ../booklending_utils:/booklending_utils
@@ -30,6 +32,24 @@ services:
       # The above volume mounts are required so that the local dev bind mount below
       # does not clobber the data generated inside the image / container
       - .:/openlibrary
+
+  fast_web:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.oldev
+    restart: unless-stopped
+    hostname: "$HOSTNAME"
+    environment:
+      - GUNICORN_OPTS= --workers 2 --timeout 180 --max-requests 500
+      - OL_CONFIG=/olsystem/etc/openlibrary.yml
+    env_file:
+      - ./.env.local
+    volumes:
+      - ../olsystem:/olsystem
+      # Persistent volume mount for generated css and js
+      - ol-build:/openlibrary/static/build
+      - .:/openlibrary
+
 
   memcached:
     restart: unless-stopped

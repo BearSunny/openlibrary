@@ -59,6 +59,13 @@ $ is_privileged_user = ctx.user and (ctx.user.is_admin() or ctx.user.is_super_li
           alt="$_('Open Library logo')"/>
       </div>
     </a>
+    $# detect-missing-i18n-skip-line
+    <a
+      href="$changequery(dict(show_page_status=1))"
+      style="color:transparent;position:absolute;pointer-events:none;"
+      tabindex="-1"
+      aria-hidden="true"
+    >Page Status</a>
   </div>
 
   $ browseProps = {
@@ -94,7 +101,7 @@ $ is_privileged_user = ctx.user and (ctx.user.is_admin() or ctx.user.is_super_li
             </select>
           </label>
         </div>
-        <form class="search-bar-input" action="/search" method="get">
+        <form class="search-bar-input" action="/search" method="get" role="search">
           <input type="text" name="q" placeholder="$_('Search')" aria-label="Search" autocomplete="off">
           <input name="mode" type="checkbox" aria-hidden="true" aria-label="Search checkbox" checked="checked" value="" id="ftokenstop" class="hidden instantsearch-mode">
           <input type="submit" value="" class="search-bar-submit" aria-label="Search submit">

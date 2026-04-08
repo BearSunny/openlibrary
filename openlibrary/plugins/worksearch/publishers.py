@@ -1,6 +1,8 @@
 """Publisher pages"""
 
 import logging
+from dataclasses import dataclass
+from typing import override
 
 import web
 
@@ -17,7 +19,11 @@ class publishers(subjects.subjects):
 
     def GET(self, key):
         key = key.replace("_", " ")
-        page = subjects.get_subject(key, details=True)
+        page = subjects.get_subject(
+            key,
+            details=True,
+            request_label='SUBJECT_ENGINE_PAGE',
+        )
 
         if not page or page.work_count == 0:
             web.ctx.status = "404 Not Found"
@@ -27,20 +33,6 @@ class publishers(subjects.subjects):
 
     def is_enabled(self):
         return "publishers" in web.ctx.features
-
-
-class publishers_json(subjects.subjects_json):
-    path = '(/publishers/[^/]+)'
-    encoding = "json"
-
-    def is_enabled(self):
-        return "publishers" in web.ctx.features
-
-    def normalize_key(self, key):
-        return key
-
-    def process_key(self, key):
-        return key.replace("_", " ")
 
 
 class index(delegate.page):
@@ -82,7 +74,15 @@ class publisher_search(delegate.page):
         ]
 
 
+@dataclass
 class PublisherEngine(subjects.SubjectEngine):
+    name: str = "publisher"
+    key: str = "publishers"
+    prefix: str = "/publishers/"
+    facet: str = "publisher_facet"
+    facet_key: str = "publisher_facet"
+
+    @override
     def normalize_key(self, key):
         return key
 
@@ -102,13 +102,4 @@ class PublisherEngine(subjects.SubjectEngine):
 
 
 def setup():
-    subjects.SUBJECTS.append(
-        subjects.SubjectMeta(
-            name="publisher",
-            key="publishers",
-            prefix="/publishers/",
-            facet="publisher_facet",
-            facet_key="publisher_facet",
-            Engine=PublisherEngine,
-        )
-    )
+    subjects.SUBJECTS.append(PublisherEngine())

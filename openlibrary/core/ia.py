@@ -5,7 +5,7 @@ import logging
 from collections.abc import Callable, Generator
 from urllib.parse import urlencode
 
-import requests
+import httpx
 import web
 
 from infogami import config
@@ -14,12 +14,17 @@ from openlibrary.core import cache
 
 logger = logging.getLogger('openlibrary.ia')
 
-# FIXME: We can't reference `config` in module scope like this; it will always be undefined!
-# See lending.py for an example of how to do it correctly.
-IA_BASE_URL = config.get('ia_base_url', 'https://archive.org')
+IA_BASE_URL = 'https://archive.org'
 VALID_READY_REPUB_STATES = ['4', '19', '20', '22']
 EXEMPT_COLLECTIONS = ["collection:thoth-archiving-network"]
-session = requests.Session()
+session = httpx.Client()
+
+
+def setup(config):
+    """Initializes this module from openlibrary config."""
+    global IA_BASE_URL
+
+    IA_BASE_URL = config.get('ia_base_url', 'https://archive.org')
 
 
 def get_api_response(url: str, params: dict | None = None) -> dict:
@@ -32,7 +37,7 @@ def get_api_response(url: str, params: dict | None = None) -> dict:
     stats.begin('archive.org', url=url)
     try:
         r = session.get(url, params=params, timeout=3)
-        if r.status_code == requests.codes.ok:
+        if r.status_code == httpx.codes.OK:
             api_response = r.json()
         else:
             logger.info(f'{r.status_code} response received from {url}')
@@ -40,6 +45,48 @@ def get_api_response(url: str, params: dict | None = None) -> dict:
         logger.exception(f'Exception occurred accessing {url}.')
     stats.end()
     return api_response
+
+
+def save_page_now(
+    url: str, access_key: str | None = None, secret_key: str | None = None
+) -> str:
+    """Archive a URL using the Internet Archive Save Page Now API.
+
+    Returns job_id on success, or an error string like "NO_CREDENTIALS",
+    "ERROR_HTTP_<code>", or "ERROR_EXCEPTION_<msg>" on failure.
+    """
+    if not access_key or not secret_key:
+        access_key, secret_key = get_ia_s3_keys()
+
+    if not access_key or not secret_key:
+        return "NO_CREDENTIALS"
+
+    headers = {
+        "Authorization": f"LOW {access_key}:{secret_key}",
+        "Accept": "application/json",
+    }
+    data = {"url": url}
+
+    try:
+        r = session.post(
+            "https://web.archive.org/save", headers=headers, data=data, timeout=30
+        )
+        if r.status_code == 200:
+            try:
+                result = r.json()
+            except ValueError:
+                return f"ERROR_NO_JOB_ID_{r.status_code}"
+            return result.get('job_id', f"ERROR_NO_JOB_ID_{r.status_code}")
+        else:
+            return f"ERROR_HTTP_{r.status_code}"
+    except (httpx.RequestException, ValueError) as e:
+        return f"ERROR_EXCEPTION_{str(e)[:50]}"
+
+
+def get_ia_s3_keys() -> tuple[str | None, str | None]:
+    """Resolve IA S3 creds via infogami config."""
+    spn_config = config.get("ol_spn_api_s3", {})
+    return spn_config.get("s3_key"), spn_config.get("s3_secret")
 
 
 def get_metadata_direct(
@@ -120,7 +167,7 @@ def edition_from_item_metadata(itemid: str, metadata: dict) -> 'ItemEdition | No
 def get_cover_url(item_id: str) -> str:
     """Gets the URL of the archive.org item's cover page."""
     base_url = f'{IA_BASE_URL}/services/img/{item_id}/full/pct:600/0/'
-    cover_response = requests.head(base_url + 'default.jpg', allow_redirects=True)
+    cover_response = session.head(base_url + 'default.jpg', follow_redirects=True)
     if cover_response.status_code == 404:
         return get_fallback_cover_url(item_id)
     return base_url + 'default.jpg'
@@ -129,7 +176,7 @@ def get_cover_url(item_id: str) -> str:
 def get_fallback_cover_url(item_id: str) -> str:
     """Gets the URL of the archive.org item's title (or cover) page."""
     base_url = f'{IA_BASE_URL}/download/{item_id}/page/'
-    title_response = requests.head(base_url + 'title.jpg', allow_redirects=True)
+    title_response = session.head(base_url + 'title.jpg', follow_redirects=True)
     if title_response.status_code == 404:
         return base_url + 'cover.jpg'
     return base_url + 'title.jpg'

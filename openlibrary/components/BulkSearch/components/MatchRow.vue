@@ -1,8 +1,12 @@
 <template>
   <tr>
     <td>{{ index + 1 }}</td>
-    <td>{{ bookMatch.extractedBook.title }}</td>
-    <td>{{ bookMatch.extractedBook.author }}</td>
+    <td
+      v-for="(column, colIndex) in columns"
+      :key="colIndex"
+    >
+      {{ bookMatch.extractedBook[column] || '' }}
+    </td>
     <td>
       <div class="bookCards">
         <a
@@ -13,6 +17,7 @@
           v-for="(doc, index) in bookMatch.solrDocs.docs"
           :key="index"
           :doc="doc"
+          :is-primary="index === 0"
         />
         <NoBookCard v-if="bookMatch.solrDocs.numFound===0" />
       </div>
@@ -32,6 +37,7 @@ export default {
     props: {
         bulkSearchState: BulkSearchState,
         bookMatch: BookMatch,
+        columns: Array,
         index: Number
     },
     computed: {
@@ -54,6 +60,10 @@ th {
     align-items: center;
     overflow-x:auto;
     scrollbar-width:thin;
+
+    .book-card--primary {
+        margin-right: 20px;
+    }
 }
 
 
