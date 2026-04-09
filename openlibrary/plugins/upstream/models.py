@@ -14,10 +14,7 @@ from infogami.utils import stats
 from infogami.utils.view import safeint  # noqa: F401 side effects may be needed
 from openlibrary.core import ia, lending, models
 from openlibrary.core.models import Image
-from openlibrary.plugins.upstream import (
-    account,  # noqa: F401 side effects may be needed
-    borrow,
-)
+from openlibrary.plugins.upstream import borrow
 from openlibrary.plugins.upstream.table_of_contents import TableOfContents
 from openlibrary.plugins.upstream.utils import MultiDict, get_identifier_config
 from openlibrary.plugins.worksearch.code import works_by_author
@@ -241,7 +238,7 @@ class Edition(models.Edition):
         resource_pattern = r'acs:(\w+):(.*)'
         for resource_urn in self.get_lending_resources():
             if resource_urn.startswith('acs:'):
-                (type, resource_id) = re.match(resource_pattern, resource_urn).groups()
+                type, resource_id = re.match(resource_pattern, resource_urn).groups()
                 loans.append(
                     {'resource_id': resource_id, 'resource_type': type, 'size': None}
                 )
@@ -528,6 +525,7 @@ class Author(models.Author):
             has_fulltext=i.mode == "ebooks",
             query=q,
             facet=True,
+            request_label='AUTHOR_BOOKS_PAGE',
         )
 
     def get_work_count(self):
@@ -603,7 +601,7 @@ class Work(models.Work):
         solr = get_solr()
         stats.begin("solr", get=self.key, fields=fields)
         try:
-            return solr.get(self.key, fields=fields)
+            return solr.get(self.key, fields=fields, request_label='GET_WORK_SOLR_DATA')
         except Exception:
             logging.getLogger("openlibrary").exception("Failed to get solr data")
             return None

@@ -1,6 +1,8 @@
-from typing import TYPE_CHECKING, Any, Final
+import logging
+from typing import TYPE_CHECKING, Any, Final, NotRequired, TypedDict, cast
 
 import web
+from pydantic import TypeAdapter, ValidationError
 
 from openlibrary.catalog.utils import (
     author_dates_match,
@@ -14,6 +16,7 @@ from openlibrary.utils import extract_numeric_id_from_olid, uniq
 if TYPE_CHECKING:
     from openlibrary.plugins.upstream.models import Author
 
+logger = logging.getLogger("openlibrary.catalog.add_book.load_book")
 
 # Sort by descending length to remove the _longest_ match.
 # E.g. remove "señorita" and not "señor", when both match.
@@ -58,7 +61,7 @@ HONORIFICS: Final = sorted(
         'sra.',
         'srta.',
     ],
-    key=lambda x: len(x),
+    key=len,
     reverse=True,
 )
 
@@ -92,11 +95,33 @@ def east_in_by_statement(rec: dict[str, Any], author: dict[str, Any]) -> bool:
     return rec['by_statement'].find(name) != -1
 
 
-def do_flip(author: dict[str, Any]) -> None:
+class AuthorImportDict(TypedDict):
     """
-    Given an author import dict, flip its name in place
+    Keys expected in the author import dict.
+
+    TODO: Make https://github.com/internetarchive/openlibrary/blob/master/openlibrary/schemata/import.schema.json#L135 consistent with this
+    """
+
+    name: str
+    personal_name: NotRequired[str]
+    alternate_names: NotRequired[list]
+    entity_type: NotRequired[str]
+    remote_ids: NotRequired[dict]
+    birth_date: NotRequired[str]
+    death_date: NotRequired[str]
+    date: NotRequired[str]
+    title: NotRequired[str]
+
+
+def do_flip(author: AuthorImportDict) -> None:
+    """
+    Given an author import dict, flip its name
+    and any alternate_names in place
     i.e. Smith, John => John Smith
     """
+    alternate_names = [flip_name(name) for name in author.get('alternate_names', [])]
+    if alternate_names:
+        author['alternate_names'] = alternate_names
     if 'personal_name' in author and author['personal_name'] != author['name']:
         # Don't flip names if name is more complex than personal_name (legacy behaviour)
         return
@@ -116,7 +141,7 @@ def do_flip(author: dict[str, Any]) -> None:
         author['personal_name'] = name
 
 
-def pick_from_matches(author: dict[str, Any], match: list["Author"]) -> "Author":
+def pick_from_matches(author: AuthorImportDict, match: list["Author"]) -> "Author":
     """
     Finds the best match for author from a list of OL authors records, match.
 
@@ -137,12 +162,12 @@ def pick_from_matches(author: dict[str, Any], match: list["Author"]) -> "Author"
     return min(maybe, key=key_int)
 
 
-def find_author(author: dict[str, Any]) -> list["Author"]:
+def find_author(author: AuthorImportDict) -> list["Author"]:
     """
     Searches OL for an author by a range of queries.
     """
 
-    def has_dates(author: "dict | Author") -> bool:
+    def has_dates(author: "dict | Author | AuthorImportDict") -> bool:
         return 'birth_date' in author or 'death_date' in author
 
     def walk_redirects(obj, seen):
@@ -195,22 +220,25 @@ def find_author(author: dict[str, Any]) -> list["Author"]:
             return [selected_match]
 
     # Fall back to name/date matching, which we did before introducing identifiers.
-    name = author["name"].replace("*", r"\*")
-    queries = [
-        {"type": "/type/author", "name~": name},
-        {"type": "/type/author", "alternate_names~": name},
-        {
-            "type": "/type/author",
-            "name~": f"* {name.split()[-1]}",
-            "birth_date~": f"*{extract_year(author.get('birth_date', '')) or -1}*",
-            "death_date~": f"*{extract_year(author.get('death_date', '')) or -1}*",
-        },  # Use `-1` to ensure an empty string from extract_year doesn't match empty dates.
-    ]
+    names = [author["name"]]
+    names += author.get("alternate_names", [])
     things = []
-    for query in queries:
-        if reply := list(web.ctx.site.things(query)):
-            things = get_redirected_authors(list(web.ctx.site.get_many(reply)))
-            break
+    for name in names:
+        name = name.replace("*", r"\*")
+        queries = [
+            {"type": "/type/author", "name~": name},
+            {"type": "/type/author", "alternate_names~": name},
+            {
+                "type": "/type/author",
+                "name~": f"* {name.split()[-1]}",
+                "birth_date~": f"*{extract_year(author.get('birth_date', '')) or -1}*",
+                "death_date~": f"*{extract_year(author.get('death_date', '')) or -1}*",
+            },  # Use `-1` to ensure an empty string from extract_year doesn't match empty dates.
+        ]
+        for query in queries:
+            if reply := list(web.ctx.site.things(query)):
+                things += get_redirected_authors(list(web.ctx.site.get_many(reply)))
+                break
     match = []
     seen = set()
     # If author has dates, we only consider dated candidates,
@@ -232,7 +260,7 @@ def find_author(author: dict[str, Any]) -> list["Author"]:
     return [pick_from_matches(author, match)]
 
 
-def find_entity(author: dict[str, Any]) -> "Author | None":
+def find_entity(author: AuthorImportDict) -> "Author | None":
     """
     Looks for an existing Author record in OL
     and returns it if found.
@@ -271,7 +299,7 @@ def remove_author_honorifics(name: str) -> str:
 
 
 def author_import_record_to_author(
-    author_import_record: dict[str, Any], eastern=False
+    author_import_record_dict: dict, eastern=False
 ) -> "Author | dict[str, Any]":
     """
     Converts an import style new-author dictionary into an
@@ -283,7 +311,18 @@ def author_import_record_to_author(
     :return: Open Library style Author representation, either existing Author with "key",
              or new candidate dict without "key".
     """
-    assert isinstance(author_import_record, dict)
+    try:
+        TypeAdapter(AuthorImportDict).validate_python(author_import_record_dict)
+    except ValidationError as exc:
+        logger.warning(
+            "Author import record failed validation but continuing import flow",
+            extra={
+                "record": author_import_record_dict,
+                "validation_errors": exc.errors(),
+            },
+            exc_info=True,
+        )
+    author_import_record = cast(AuthorImportDict, author_import_record_dict)
     if author_import_record.get('entity_type') != 'org' and not eastern:
         do_flip(author_import_record)
     if existing := find_entity(author_import_record):
@@ -295,7 +334,7 @@ def author_import_record_to_author(
         if 'death_date' in author_import_record and 'death_date' not in existing:
             new['death_date'] = author_import_record['death_date']
         return new
-    a = {'type': {'key': '/type/author'}}
+    a: dict[str, Any] = {'type': {'key': '/type/author'}}
     for f in (
         'name',
         'title',
@@ -304,6 +343,8 @@ def author_import_record_to_author(
         'death_date',
         'date',
         'remote_ids',
+        'entity_type',
+        'alternate_names',
     ):
         if f in author_import_record:
             a[f] = author_import_record[f]

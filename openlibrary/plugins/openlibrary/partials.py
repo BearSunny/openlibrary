@@ -1,28 +1,23 @@
-import json
 from abc import ABC, abstractmethod
 from datetime import datetime
-from typing import cast
 from urllib.parse import parse_qs
 
 import web
+from pydantic import BaseModel
 
-from infogami.utils import delegate
 from infogami.utils.view import render_template
-from openlibrary.core.fulltext import fulltext_search
+from openlibrary.accounts import get_current_user
+from openlibrary.core.fulltext import fulltext_search_async
 from openlibrary.core.lending import compose_ia_url, get_available
 from openlibrary.i18n import gettext as _
-from openlibrary.plugins.openlibrary.lists import get_user_lists
+from openlibrary.plugins.openlibrary.lists import get_lists_async, get_user_lists
 from openlibrary.plugins.upstream.yearly_reading_goals import get_reading_goals
-from openlibrary.plugins.worksearch.code import do_search, work_search
+from openlibrary.plugins.worksearch.code import do_search_async, work_search
 from openlibrary.plugins.worksearch.subjects import (
     date_range_to_publish_year_filter,
     get_subject,
 )
 from openlibrary.views.loanstats import get_trending_books
-
-
-class PartialResolutionError(Exception):
-    pass
 
 
 class PartialDataHandler(ABC):
@@ -41,13 +36,13 @@ class PartialDataHandler(ABC):
 class ReadingGoalProgressPartial(PartialDataHandler):
     """Handler for reading goal progress."""
 
-    def __init__(self):
-        self.i = web.input(year=None)
+    def __init__(self, year: int):
+        self.year = year
 
     def generate(self) -> dict:
-        year = self.i.year or datetime.now().year
+        year = self.year or datetime.now().year
         goal = get_reading_goals(year=year)
-        component = render_template('check_ins/reading_goal_progress', [goal])
+        component = render_template('reading_goals/reading_goal_progress', [goal])
 
         return {"partials": str(component)}
 
@@ -73,27 +68,37 @@ class MyBooksDropperListsPartial(PartialDataHandler):
         }
 
 
+class CarouselLoadMoreParams(BaseModel):
+    """Parameters for the carousel load-more partial."""
+
+    queryType: str = ""
+    q: str = ""
+    limit: int = 18
+    page: int = 1
+    sorts: str = ""
+    subject: str = ""
+    hasFulltextOnly: bool = False
+    key: str = ""
+    layout: str | None = None
+    published_in: str = ""
+
+
 class CarouselCardPartial(PartialDataHandler):
     """Handler for carousel "load_more" requests"""
 
     MAX_VISIBLE_CARDS = 5
 
-    def __init__(self):
-        self.i = web.input(params=None)
+    def __init__(self, params: CarouselLoadMoreParams):
+        self.params = params
 
     def generate(self) -> dict:
-        # Determine query type
-        params = self.i or {}
-        query_type = params.get("queryType", "")
+        p = self.params
 
         # Do search
-        search_results = self._make_book_query(query_type, params)
+        search_results = self._make_book_query(p.queryType, p)
 
         # Render cards
         cards = []
-        layout = params.get("layout")
-        key = params.get("key") or ""
-
         for index, work in enumerate(search_results):
             lazy = index > self.MAX_VISIBLE_CARDS
             editions = work.get('editions', {})
@@ -110,14 +115,14 @@ class CarouselCardPartial(PartialDataHandler):
                     "books/custom_carousel_card",
                     web.storage(book),
                     lazy,
-                    layout,
-                    key=key,
+                    p.layout,
+                    key=p.key,
                 )
             )
 
         return {"partials": [str(template) for template in cards]}
 
-    def _make_book_query(self, query_type: str, params: dict) -> list:
+    def _make_book_query(self, query_type: str, params: CarouselLoadMoreParams) -> list:
         if query_type == "SEARCH":
             return self._do_search_query(params)
         if query_type == "BROWSE":
@@ -129,7 +134,7 @@ class CarouselCardPartial(PartialDataHandler):
 
         raise ValueError("Unknown query type")
 
-    def _do_search_query(self, params: dict) -> list:
+    def _do_search_query(self, params: CarouselLoadMoreParams) -> list:
         fields = [
             'key',
             'title',
@@ -145,59 +150,42 @@ class CarouselCardPartial(PartialDataHandler):
             'id_openstax',
             'editions',
         ]
-        query = params.get("q", "")
-        sort = params.get("sorts", "new")  # XXX : check "new" assumption
-        limit = int(params.get("limit", 20))
-        page = int(params.get("page", 1))
-        query_params = {"q": query}
-
-        if params.get("hasFulltextOnly"):
+        query_params: dict = {"q": params.q}
+        if params.hasFulltextOnly:
             query_params['has_fulltext'] = 'true'
 
         results = work_search(
             query_params,
-            sort=sort,
+            sort=params.sorts or "new",
             fields=','.join(fields),
-            limit=limit,
+            limit=params.limit,
             facet=False,
-            offset=page,
+            offset=params.page,
         )
         return results.get("docs", [])
 
-    def _do_browse_query(self, params: dict) -> list:
-        query = params.get("q", "")
-        subject = params.get("subject", "")
-        sorts = params.get("sorts", "").split(',')
-        limit = int(params.get("limit", 18))
-        page = int(params.get("page", 1))
+    def _do_browse_query(self, params: CarouselLoadMoreParams) -> list:
         url = compose_ia_url(
-            query=query,
-            limit=limit,
-            page=page,
-            subject=subject,
-            sorts=sorts,
+            query=params.q,
+            limit=params.limit,
+            page=params.page,
+            subject=params.subject,
+            sorts=params.sorts.split(',') if params.sorts else [],
             advanced=True,
             safe_mode=True,
         )
         results = get_available(url=url)
         return results if "error" not in results else []
 
-    def _do_trends_query(self, params: dict) -> list:
-        page = int(params.get("page", 1))
-        limit = int(params.get("limit", 18))
+    def _do_trends_query(self, params: CarouselLoadMoreParams) -> list:
         return get_trending_books(
-            minimum=3, limit=limit, page=page, sort_by_count=False
+            minimum=3, limit=params.limit, page=params.page, sort_by_count=False
         )
 
-    def _do_subjects_query(self, params: dict) -> list:
-        pseudoKey = params.get("q", "")
-        offset = int(params.get("page", 1))
-        limit = int(params.get("limit", 18))
-        published_in = params.get("published_in", "")
-        publish_year = date_range_to_publish_year_filter(published_in)
-
+    def _do_subjects_query(self, params: CarouselLoadMoreParams) -> list:
+        publish_year = date_range_to_publish_year_filter(params.published_in)
         subject = get_subject(
-            pseudoKey, offset=offset, limit=limit, publish_year=publish_year
+            params.q, offset=params.page, limit=params.limit, publish_year=publish_year
         )
         return subject.get("works", [])
 
@@ -205,15 +193,14 @@ class CarouselCardPartial(PartialDataHandler):
 class AffiliateLinksPartial(PartialDataHandler):
     """Handler for affiliate links"""
 
-    def __init__(self):
-        self.i = web.input(data=None)
+    def __init__(self, data: dict):
+        self.data = data
 
     def generate(self) -> dict:
-        data = json.loads(self.i.data)
-        args = data.get("args", [])
+        args = self.data.get("args", [])
 
         if len(args) < 2:
-            raise PartialResolutionError("Unexpected amount of arguments")
+            raise ValueError("Unexpected amount of arguments")
 
         macro = web.template.Template.globals['macros'].AffiliateLinks(args[0], args[1])
         return {"partials": str(macro)}
@@ -222,24 +209,32 @@ class AffiliateLinksPartial(PartialDataHandler):
 class SearchFacetsPartial(PartialDataHandler):
     """Handler for search facets sidebar and "selected facets" affordances."""
 
-    def __init__(self):
-        self.i = web.input(data=None)
+    def __init__(self, data: dict, sfw: bool = False):
+        self.sfw = sfw
+        self.data = data
+        user = get_current_user()
+        self.show_merge_authors = user and (
+            user.is_librarian() or user.is_super_librarian() or user.is_admin()
+        )
 
     def generate(self) -> dict:
-        data = json.loads(self.i.data)
-        path = data.get('path')
-        query = data.get('query', '')
+        raise NotImplementedError("Use generate_async instead")
+
+    async def generate_async(self) -> dict:
+        path = self.data.get('path')
+        query = self.data.get('query', '')
         parsed_qs = parse_qs(query.replace('?', ''))
-        param = data.get('param', {})
+        param = self.data.get('param', {})
 
         sort = None
-        search_response = do_search(
+        search_response = await do_search_async(
             param,
             sort,
             rows=0,
             spellcheck_count=3,
             facet=True,
-            query_label='BOOK_SEARCH_FACETS',
+            request_label='BOOK_SEARCH_FACETS',
+            sfw=self.sfw,
         )
 
         sidebar = render_template(
@@ -249,6 +244,7 @@ class SearchFacetsPartial(PartialDataHandler):
             async_load=False,
             path=path,
             query=parsed_qs,
+            show_merge_authors=self.show_merge_authors,
         )
 
         active_facets = render_template(
@@ -270,16 +266,18 @@ class SearchFacetsPartial(PartialDataHandler):
 class FullTextSuggestionsPartial(PartialDataHandler):
     """Handler for rendering full-text search suggestions."""
 
-    def __init__(self):
-        self.i = web.input(data=None)
+    def __init__(self, query: str):
+        self.query = query or ""
+        self.has_error: bool = False
 
     def generate(self) -> dict:
-        query = self.i.get("data", "")
-        data = fulltext_search(query)
+        raise NotImplementedError("Use generate_async instead")
+
+    async def generate_async(self) -> dict:
+        query = self.query
+        data = await fulltext_search_async(query)
         # Add caching headers only if there were no errors in the search results
-        if 'error' not in data:
-            # Cache for 5 minutes (300 seconds)
-            web.header('Cache-Control', 'public, max-age=300')
+        self.has_error = "error" in data
         hits = data.get('hits', [])
         if not hits['hits']:
             macro = '<div></div>'
@@ -293,117 +291,71 @@ class FullTextSuggestionsPartial(PartialDataHandler):
 class BookPageListsPartial(PartialDataHandler):
     """Handler for rendering the book page "Lists" section"""
 
-    def __init__(self):
-        self.i = web.input(workId="", editionId="")
+    def __init__(self, workId: str, editionId: str):
+        self.workId = workId
+        self.editionId = editionId
 
     def generate(self) -> dict:
-        results: dict = {"partials": []}
-        work_id = self.i.workId
-        edition_id = self.i.editionId
+        raise NotImplementedError("Use generate_async instead")
 
-        work = (work_id and web.ctx.site.get(work_id)) or None
-        edition = (edition_id and web.ctx.site.get(edition_id)) or None
+    async def generate_async(self) -> dict:
+        results: dict = {"partials": []}
+        keys = [k for k in (self.workId, self.editionId) if k]
 
         # Do checks and render
-        has_lists = (work and work.get_lists(limit=1)) or (
-            edition and edition.get_lists(limit=1)
-        )
-        results["hasLists"] = bool(has_lists)
+        lists = await get_lists_async(keys)
+        results["hasLists"] = bool(lists)
 
-        if not has_lists:
+        if not lists:
             results["partials"].append(_('This work does not appear on any lists.'))
         else:
-            if work and work.key:
-                work_list_template = render_template(
-                    "lists/widget", work, include_header=False, include_widget=False
-                )
-                results["partials"].append(str(work_list_template))
-            if edition and edition.get("type", "") != "/type/edition":
-                edition_list_template = render_template(
-                    "lists/widget",
-                    edition,
-                    include_header=False,
-                    include_widget=False,
-                )
-                results["partials"].append(str(edition_list_template))
+            query = "seed_count:[2 TO *] seed:(%s)" % " OR ".join(
+                f'"{k}"' for k in keys
+            )
+            all_url = "/search/lists?q=" + web.urlquote(query) + "&sort=last_modified"
+            lists_template = render_template("lists/carousel", lists, all_url)
+            results["partials"].append(str(lists_template))
 
         return results
+
+
+class LazyCarouselParams(BaseModel):
+    """Parameters for the lazy carousel partial."""
+
+    query: str = ""
+    title: str | None = None
+    sort: str = "new"
+    key: str = ""
+    limit: int = 20
+    search: bool = False
+    has_fulltext_only: bool = True
+    url: str | None = None
+    layout: str = "carousel"
+    fallback: str | None = None
 
 
 class LazyCarouselPartial(PartialDataHandler):
     """Handler for lazily-loaded query carousels."""
 
-    def __init__(self):
-        self.i = web.input(
-            query="",
-            title=None,
-            sort="new",
-            key="",
-            limit=20,
-            search=False,
-            has_fulltext_only=True,
-            url=None,
-            layout="carousel",
-        )
-        self.i.search = self.i.search != "false"
-        self.i.has_fulltext_only = self.i.has_fulltext_only != "false"
+    def __init__(self, params: LazyCarouselParams):
+        self.params = params
 
     def generate(self) -> dict:
         macro = web.template.Template.globals['macros'].CacheableMacro(
             "RawQueryCarousel",
-            self.i.query,
+            self.params.query,
             lazy=False,
-            title=self.i.title,
-            sort=self.i.sort,
-            key=self.i.key,
-            limit=int(self.i.limit),
-            search=self.i.search,
-            has_fulltext_only=self.i.has_fulltext_only,
-            url=self.i.url,
-            layout=self.i.layout,
+            title=self.params.title,
+            sort=self.params.sort,
+            key=self.params.key,
+            limit=self.params.limit,
+            search=self.params.search,
+            has_fulltext_only=self.params.has_fulltext_only,
+            url=self.params.url,
+            layout=self.params.layout,
+            fallback=self.params.fallback,
         )
         return {"partials": str(macro)}
-
-
-class PartialRequestResolver:
-    # Maps `_component` values to PartialDataHandler subclasses
-    component_mapping = {  # noqa: RUF012
-        "CarouselLoadMore": CarouselCardPartial,
-        "AffiliateLinks": AffiliateLinksPartial,
-        "SearchFacets": SearchFacetsPartial,
-        "FulltextSearchSuggestion": FullTextSuggestionsPartial,
-        "BPListsSection": BookPageListsPartial,
-        "LazyCarousel": LazyCarouselPartial,
-        "MyBooksDropperLists": MyBooksDropperListsPartial,
-        "ReadingGoalProgress": ReadingGoalProgressPartial,
-    }
-
-    @staticmethod
-    def resolve(component: str) -> dict:
-        """Gets an instantiated PartialDataHandler and returns its generated dict"""
-        handler = PartialRequestResolver.get_handler(component)
-        return handler.generate()
-
-    @classmethod
-    def get_handler(cls, component: str) -> PartialDataHandler:
-        """Instantiates and returns the requested handler"""
-        if klass := cls.component_mapping.get(component):
-            concrete_class = cast(type[PartialDataHandler], klass)
-            return concrete_class()
-        raise PartialResolutionError(f'No handler found for key "{component}"')
-
-
-class Partials(delegate.page):
-    path = '/partials'
-    encoding = 'json'
-
-    def GET(self):
-        i = web.input(_component=None)
-        component = i.pop("_component")
-        return delegate.RawText(
-            json.dumps(PartialRequestResolver.resolve(component)),
-            content_type='application/json',
-        )
 
 
 def setup():

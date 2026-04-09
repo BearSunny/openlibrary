@@ -1,27 +1,29 @@
 import copy
 import functools
 import itertools
-import json
 import logging
 import re
 import time
 import urllib
 from collections.abc import Iterable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal, cast
 from unicodedata import normalize
 
-import requests
+import httpx
 import web
 from requests import Response
 
 from infogami import config
 from infogami.infobase.client import storify
-from infogami.utils import delegate, stats
+from infogami.utils import delegate
 from infogami.utils.view import public, render, render_template, safeint
 from openlibrary.core import cache
+from openlibrary.core.env import get_ol_env
 from openlibrary.core.lending import add_availability
 from openlibrary.core.models import Edition
+from openlibrary.fastapi.models import SolrInternalsParams
 from openlibrary.i18n import gettext as _
 from openlibrary.plugins.openlibrary.processors import urlsafe
 from openlibrary.plugins.upstream.utils import (
@@ -41,10 +43,13 @@ from openlibrary.plugins.worksearch.schemes.works import (
 from openlibrary.plugins.worksearch.search import get_solr
 from openlibrary.solr.query_utils import fully_escape_query
 from openlibrary.solr.solr_types import SolrDocument
+from openlibrary.utils.async_utils import async_bridge
 from openlibrary.utils.isbn import normalize_isbn
+from openlibrary.utils.request_context import req_context
 from openlibrary.utils.solr import (
     DEFAULT_PASS_TIME_ALLOWED,
     DEFAULT_SOLR_TIMEOUT_SECONDS,
+    SolrRequestLabel,
 )
 
 logger = logging.getLogger("openlibrary.worksearch")
@@ -57,6 +62,7 @@ re_olid = re.compile(r'^OL\d+([AMW])$')
 
 plurals = {f + 's': f for f in ('publisher', 'author')}
 
+default_spellcheck_count = 10
 if hasattr(config, 'plugin_worksearch'):
     solr_select_url = (
         config.plugin_worksearch.get('solr_base_url', 'localhost') + '/select'
@@ -86,6 +92,10 @@ def get_solr_works(
     work_keys: set[str], fields: Iterable[str] | None = None, editions=False
 ) -> dict[str, web.storage]:
     from openlibrary.plugins.worksearch.search import get_solr
+
+    # Avoid making query if no work keys provided
+    if not work_keys:
+        return cast(dict[str, web.storage], {})
 
     if not fields:
         fields = WorkSearchScheme.default_fetched_fields | {'editions', 'providers'}
@@ -132,7 +142,13 @@ def process_facet(
                 key, name = read_author_facet(val)
                 yield (key, name, count)
             elif field == 'language':
-                yield (val, get_language_name(f'/languages/{val}'), count)
+                yield (
+                    val,
+                    get_language_name(
+                        f'/languages/{val}', req_context.get().lang or 'en'
+                    ),
+                    count,
+                )
             else:
                 yield (val, val, count)
 
@@ -146,32 +162,31 @@ def process_facet_counts(
         yield field, list(process_facet(field, web.group(facets, 2)))
 
 
-def execute_solr_query(
+async def execute_solr_query_async(
     solr_path: str,
     params: dict | list[tuple[str, Any]],
     _timeout: int | None = DEFAULT_SOLR_TIMEOUT_SECONDS,
     _pass_time_allowed: bool = DEFAULT_PASS_TIME_ALLOWED,
-) -> Response | None:
+) -> httpx.Response | None:
     url = solr_path
     if params:
         url += '&' if '?' in url else '?'
         url += urlencode(params)
 
-    stats.begin("solr", url=url)
     try:
-        response = get_solr().raw_request(
+        response = await get_solr().raw_request(
             solr_path,
             urlencode(params),
             _timeout=_timeout,
             _pass_time_allowed=_pass_time_allowed,
         )
-    except requests.HTTPError:
+    except httpx.HTTPError:
         logger.exception("Failed solr query")
         return None
-    finally:
-        stats.end()
     return response
 
+
+execute_solr_query = async_bridge.wrap(execute_solr_query_async)
 
 # Expose this publicly
 public(has_solr_editions_enabled)
@@ -195,25 +210,7 @@ def get_remembered_layout():
     return 'details'
 
 
-QueryLabel = Literal[
-    'UNLABELLED',
-    'BOOK_SEARCH',
-    'BOOK_SEARCH_API',
-    'BOOK_SEARCH_FACETS',
-    'BOOK_CAROUSEL',
-    # Used for the internal request made by solr to choose the best edition
-    # during a normal book search
-    'EDITION_MATCH',
-    'LIST_SEARCH',
-    'LIST_SEARCH_API',
-    'SUBJECT_SEARCH',
-    'SUBJECT_SEARCH_API',
-    'AUTHOR_SEARCH',
-    'AUTHOR_SEARCH_API',
-]
-
-
-def run_solr_query(  # noqa: PLR0912
+def _prepare_solr_query_params(  # noqa: PLR0912
     scheme: SearchScheme,
     param: dict | None = None,
     rows=100,
@@ -223,12 +220,15 @@ def run_solr_query(  # noqa: PLR0912
     offset=None,
     fields: str | list[str] | None = None,
     facet: bool | Iterable[str] = True,
+    highlight: bool = False,
     allowed_filter_params: set[str] | None = None,
     extra_params: list[tuple[str, Any]] | None = None,
-    query_label: QueryLabel = 'UNLABELLED',
-):
+    request_label: SolrRequestLabel = 'UNLABELLED',
+    solr_internals_params: SolrInternalsParams | None = None,
+) -> tuple[list[tuple[str, Any]], list[str]]:
     """
     :param param: dict of query parameters
+    Prepares the list of parameters for a Solr query, encapsulating the business logic.
     """
     param = param or {}
 
@@ -245,7 +245,7 @@ def run_solr_query(  # noqa: PLR0912
         *(('fq', subquery) for subquery in scheme.universe),
         ('start', offset),
         ('rows', rows),
-        ('ol.label', query_label),
+        ('ol.label', request_label),
         ('wt', param.get('wt', 'json')),
     ] + (extra_params or [])
 
@@ -283,6 +283,8 @@ def run_solr_query(  # noqa: PLR0912
         if field == 'author_facet':
             field = 'author_key'
         values = param[field]
+        if isinstance(values, str):
+            values = [values]
         params += [('fq', f'{field}:"{val}"') for val in values if val]
 
     # Many fields in solr use the convention of `*_facet` both
@@ -312,17 +314,32 @@ def run_solr_query(  # noqa: PLR0912
                 ('editions.sort', EditionSearchScheme().process_user_sort(ed_sort))
             )
         params.append(('fl', ','.join(solr_fields)))
-        params += scheme.q_to_solr_params(q, solr_fields, params)
+        params += scheme.q_to_solr_params(
+            q,
+            solr_fields,
+            params,
+            highlight=highlight,
+            solr_internals_params=solr_internals_params,
+        )
 
     if sort:
         params.append(('sort', scheme.process_user_sort(sort)))
 
-    url = f'{solr_select_url}?{urlencode(params)}'
-    start_time = time.time()
-    response = execute_solr_query(solr_select_url, params)
+    return params, fields
+
+
+def _process_solr_response_and_enrich(
+    response: Response | None,
+    scheme: SearchScheme,
+    fields: list[str],
+    sort: str | None,
+    url: str,
+    duration: float,
+) -> 'SearchResponse':
+    """
+    Processes the Solr response, enriches it, and returns a SearchResponse object.
+    """
     solr_result = response.json() if response is not None else None
-    end_time = time.time()
-    duration = end_time - start_time
 
     if safeget(lambda: solr_result['response']['docs']):
         non_solr_fields = set(fields) & scheme.non_solr_fields
@@ -332,14 +349,98 @@ def run_solr_query(  # noqa: PLR0912
     return SearchResponse.from_solr_result(solr_result, sort, url, time=duration)
 
 
+def run_solr_query(
+    scheme: SearchScheme,
+    param: dict | None = None,
+    rows=100,
+    page=1,
+    sort: str | None = None,
+    spellcheck_count=None,
+    offset=None,
+    fields: str | list[str] | None = None,
+    facet: bool | Iterable[str] = True,
+    highlight: bool = False,
+    allowed_filter_params: set[str] | None = None,
+    extra_params: list[tuple[str, Any]] | None = None,
+    request_label: SolrRequestLabel = 'UNLABELLED',
+    solr_internals_params: SolrInternalsParams | None = None,
+) -> 'SearchResponse':
+    """
+    Builds and executes a synchronous Solr query.
+    """
+    params, fields = _prepare_solr_query_params(
+        scheme,
+        param,
+        rows=rows,
+        page=page,
+        sort=sort,
+        spellcheck_count=spellcheck_count,
+        offset=offset,
+        fields=fields,
+        facet=facet,
+        highlight=highlight,
+        allowed_filter_params=allowed_filter_params,
+        extra_params=extra_params,
+        request_label=request_label,
+        solr_internals_params=solr_internals_params,
+    )
+
+    url = f'{solr_select_url}?{urlencode(params)}'
+    start_time = time.time()
+    response = execute_solr_query(solr_select_url, params)
+    end_time = time.time()
+    duration = end_time - start_time
+
+    return _process_solr_response_and_enrich(
+        response, scheme, fields, sort, url, duration
+    )
+
+
+async def run_solr_query_async(
+    scheme: SearchScheme,
+    param: dict | None = None,
+    **kwargs,
+) -> 'SearchResponse':
+    """
+    Builds and executes an asynchronous Solr query.
+    """
+    params, fields = _prepare_solr_query_params(scheme, param, **kwargs)
+
+    url = f'{solr_select_url}?{urlencode(params)}'
+    start_time = time.time()
+    response = await execute_solr_query_async(solr_select_url, params)
+    end_time = time.time()
+    duration = end_time - start_time
+
+    return _process_solr_response_and_enrich(
+        response, scheme, fields, kwargs.get('sort'), url, duration
+    )
+
+
+@functools.cache
+def load_stopwords(lang: str = 'en') -> set[str]:
+    """
+    Load stop words for a given language
+    """
+    try:
+        with Path(f'conf/solr/conf/lang/stopwords_{lang}.txt').open() as f:
+            return {
+                line.strip() for line in f if line.strip() and not line.startswith('#')
+            }
+    except FileNotFoundError:
+        logger.warning(f"Stopwords file not found for language: {lang}")
+        return set()
+
+
 @dataclass
 class SearchResponse:
-    facet_counts: dict[str, tuple[str, str, int]]
+    facet_counts: dict[str, list[tuple[str, str, int]]]
     sort: str
     docs: list
     num_found: int
     solr_select: str
     raw_resp: dict = None
+    highlighting: dict[str, dict[str, list[str]]] | None = None
     error: str = None
     time: float = None
     """Seconds to execute the query"""
@@ -362,6 +463,8 @@ class SearchResponse:
                 time=time,
             )
         else:
+            if highlighting := solr_result.get('highlighting'):
+                highlighting = SearchResponse.clean_highlighting(highlighting)
             return SearchResponse(
                 facet_counts=(
                     dict(
@@ -376,19 +479,82 @@ class SearchResponse:
                 raw_resp=solr_result,
                 docs=solr_result['response']['docs'],
                 num_found=solr_result['response']['numFound'],
+                highlighting=highlighting,
                 solr_select=solr_select,
                 time=time,
             )
 
+    @staticmethod
+    def clean_highlighting(
+        highlighting: dict[str, dict[str, list[str]]],
+    ) -> dict[str, dict[str, list[str]]] | None:
+        """
+        Remove highlight fragments that only contain stop words, and sort by most matches.
 
-def do_search(
+        :param highlighting: solr highlighting response. e.g. {'OL123W': {'title': ['<em>title</em>']}}
+
+        NOTE: This _should_ be handled by solr automatically, but we had to disable stopwords in solr
+        due to a bug. See https://github.com/internetarchive/openlibrary/issues/5393
+
+        >>> highlighting = {'OL123W': {'title': ['<em>title</em>']}}
+        >>> SearchResponse.clean_highlighting(highlighting)
+        {'OL123W': {'title': ['<em>title</em>']}}
+
+        >>> highlighting = {'OL123W': {'title': ['<em>the</em> <em>title</em>']}}
+        >>> SearchResponse.clean_highlighting(highlighting)
+        {'OL123W': {'title': ['<em>the</em> <em>title</em>']}}
+
+        >>> highlighting = {'OL123W': {'title': ['<em>the</em> title']}}
+        >>> SearchResponse.clean_highlighting(highlighting)
+
+        >>> highlighting = {'OL123W': {'title': ['<em>The</em> title', 'a <em>foobar</em>']}}
+        >>> SearchResponse.clean_highlighting(highlighting)
+        {'OL123W': {'title': ['a <em>foobar</em>']}}
+        """
+
+        def get_matches(fragment: str) -> set[str]:
+            # Note: Solr has one wrapping `<em>` per word, even if they are adjacent
+            # Note: The Solr response is correctly html escaped, so there should be
+            # no `<` in between the `<em>` tags since they are escaped to `&lt;`
+            return {word.lower() for word in re.findall(r'<em>([^<]+)</em>', fragment)}
+
+        # For now just to English? In future we might support other languages, but it's unclear
+        # which language to use; the book's language or the user's language?
+        stopwords = load_stopwords('en')
+        for key in list(highlighting):
+            highlights = highlighting[key]
+
+            for field in list(highlights):
+                highlights[field] = [
+                    term for term in highlights[field] if get_matches(term) - stopwords
+                ]
+
+                # Sort by most matches
+                highlights[field].sort(
+                    key=lambda term: len(get_matches(term)), reverse=True
+                )
+
+                # Remove empty
+                if not highlights[field]:
+                    del highlights[field]
+
+            if not highlights:
+                del highlighting[key]
+
+        return highlighting or None
+
+
+async def do_search_async(
     param: dict,
     sort: str | None,
     page=1,
     rows=100,
     facet=False,
+    highlight=False,
     spellcheck_count=None,
-    query_label: QueryLabel = 'UNLABELLED',
+    request_label: SolrRequestLabel = 'UNLABELLED',
+    sfw: bool = False,
+    solr_internals_params: 'SolrInternalsParams | None' = None,
 ):
     """
     :param param: dict of search url parameters
@@ -407,20 +573,25 @@ def do_search(
         extra_fields.add('trending_*')
     fields = WorkSearchScheme.default_fetched_fields | extra_fields
 
-    if web.cookies(sfw="").sfw == 'yes':
+    if sfw:
         fields |= {'subject'}
 
-    return run_solr_query(
+    return await run_solr_query_async(
         WorkSearchScheme(),
         param,
-        rows,
-        page,
-        sort,
-        spellcheck_count,
+        rows=rows,
+        page=page,
+        sort=sort,
+        spellcheck_count=spellcheck_count,
         fields=list(fields),
         facet=facet,
-        query_label=query_label,
+        highlight=highlight,
+        request_label=request_label,
+        solr_internals_params=solr_internals_params,
     )
+
+
+do_search = async_bridge.wrap(do_search_async)
 
 
 def get_doc(doc: SolrDocument):
@@ -435,9 +606,7 @@ def get_doc(doc: SolrDocument):
         url=f"{doc['key']}/{urlsafe(doc['title'])}",
         edition_count=doc['edition_count'],
         ia=doc.get('ia', []),
-        collections=(
-            doc['ia_collection_s'].split(';') if doc.get('ia_collection_s') else []
-        ),
+        collections=(doc.get('ia_collection') or []),
         has_fulltext=doc.get('has_fulltext', False),
         public_scan=doc.get('public_scan_b', bool(doc.get('ia'))),
         lending_edition=doc.get('lending_edition_s', None),
@@ -451,6 +620,20 @@ def get_doc(doc: SolrDocument):
                 death_date=doc.get('death_date', None),
             )
             for key, name in zip(doc.get('author_key', []), doc.get('author_name', []))
+        ],
+        series=[
+            web.storage(
+                series=web.storage(
+                    key=key,
+                    name=name,
+                ),
+                position=position,
+            )
+            for key, name, position in zip(
+                doc.get('series_key', []),
+                doc.get('series_name', []),
+                doc.get('series_position', []),
+            )
         ],
         first_publish_year=doc.get('first_publish_year', None),
         first_edition=doc.get('first_edition', None),
@@ -612,14 +795,23 @@ class search(delegate.page):
         page = int(param.get('page', 1))
         sort = param.get('sort')
         rows = 20
+
+        if get_ol_env().OL_EXPOSE_SOLR_INTERNALS_PARAMS:
+            solr_internals_params = SolrInternalsParams.model_validate(dict(web_input))
+        else:
+            solr_internals_params = None
+
         if param:
             search_response = do_search(
                 param,
                 sort,
                 page,
                 rows=rows,
+                highlight=True,
                 spellcheck_count=3,
-                query_label='BOOK_SEARCH',
+                request_label='BOOK_SEARCH',
+                sfw=web.cookies(sfw="").sfw == 'yes',
+                solr_internals_params=solr_internals_params,
             )
         else:
             search_response = SearchResponse(
@@ -643,6 +835,7 @@ def works_by_author(
     facet=False,
     has_fulltext=False,
     query: str | None = None,
+    request_label: SolrRequestLabel = 'UNLABELLED',
 ):
     param = {'q': query or '*:*'}
     if has_fulltext:
@@ -663,6 +856,7 @@ def works_by_author(
                 "time_facet",
             ]
         ),
+        request_label=request_label,
         fields=list(
             WorkSearchScheme.default_fetched_fields | {'editions', 'providers'}
         ),
@@ -750,7 +944,7 @@ class list_search(delegate.page):
     def get_results(
         self,
         req: ListSearchRequest,
-        query_label: Literal['LIST_SEARCH', 'LIST_SEARCH_API'],
+        request_label: Literal['LIST_SEARCH', 'LIST_SEARCH_API'],
     ):
         return run_solr_query(
             ListSearchScheme(),
@@ -759,62 +953,23 @@ class list_search(delegate.page):
             rows=req.limit,
             fields=req.fields,
             sort=req.sort,
-            query_label=query_label,
+            request_label=request_label,
         )
-
-
-# inherits from list_search but modifies the GET response to return results in JSON format
-class list_search_json(list_search):
-    # used subject_search_json as a reference
-    path = '/search/lists'
-    encoding = 'json'
-
-    def GET(self):
-        req = ListSearchRequest.from_web_input(web.input())
-        resp = self.get_results(req, 'LIST_SEARCH_API')
-
-        web.header('Content-Type', 'application/json')
-        if req.api == 'next':
-            # Match search.json
-            return delegate.RawText(
-                json.dumps(
-                    {
-                        'numFound': resp.num_found,
-                        'num_found': resp.num_found,
-                        'start': req.offset,
-                        'q': req.q,
-                        'docs': resp.docs,
-                    }
-                )
-            )
-        else:
-            # Default to the old API shape for a while, then we'll flip
-            return delegate.RawText(
-                json.dumps(
-                    {
-                        'start': req.offset,
-                        'docs': [
-                            lst.preview()
-                            for lst in web.ctx.site.get_many(
-                                [doc['key'] for doc in resp.docs]
-                            )
-                        ],
-                    }
-                )
-            )
 
 
 class subject_search(delegate.page):
     path = '/search/subjects'
 
     def GET(self):
-        get_results = functools.partial(self.get_results, query_label='SUBJECT_SEARCH')
+        get_results = functools.partial(
+            self.get_results, request_label='SUBJECT_SEARCH'
+        )
         return render_template('search/subjects', get_results)
 
     def get_results(
         self,
         q,
-        query_label: Literal['SUBJECT_SEARCH', 'SUBJECT_SEARCH_API'],
+        request_label: Literal['SUBJECT_SEARCH', 'SUBJECT_SEARCH_API'],
         offset=0,
         limit=100,
     ):
@@ -824,50 +979,23 @@ class subject_search(delegate.page):
             offset=offset,
             rows=limit,
             sort='work_count desc',
-            query_label=query_label,
+            request_label=request_label,
         )
 
         return response
-
-
-class subject_search_json(subject_search):
-    path = '/search/subjects'
-    encoding = 'json'
-
-    def GET(self):
-        i = web.input(q='', offset=0, limit=100)
-        offset = safeint(i.offset, 0)
-        limit = safeint(i.limit, 100)
-        limit = min(1000, limit)  # limit limit to 1000.
-
-        response = self.get_results(
-            i.q,
-            query_label='SUBJECT_SEARCH_API',
-            offset=offset,
-            limit=limit,
-        )
-
-        # Backward compatibility :/
-        raw_resp = response.raw_resp['response']
-        for doc in raw_resp['docs']:
-            doc['type'] = doc.get('subject_type', 'subject')
-            doc['count'] = doc.get('work_count', 0)
-
-        web.header('Content-Type', 'application/json')
-        return delegate.RawText(json.dumps(raw_resp))
 
 
 class author_search(delegate.page):
     path = '/search/authors'
 
     def GET(self):
-        get_results = functools.partial(self.get_results, query_label='AUTHOR_SEARCH')
+        get_results = functools.partial(self.get_results, request_label='AUTHOR_SEARCH')
         return render_template('search/authors', get_results)
 
     def get_results(
         self,
         q,
-        query_label: Literal['AUTHOR_SEARCH', 'AUTHOR_SEARCH_API'],
+        request_label: Literal['AUTHOR_SEARCH', 'AUTHOR_SEARCH_API'],
         offset=0,
         limit=100,
         fields='*',
@@ -880,36 +1008,10 @@ class author_search(delegate.page):
             rows=limit,
             fields=fields,
             sort=sort,
-            query_label=query_label,
+            request_label=request_label,
         )
 
         return resp
-
-
-class author_search_json(author_search):
-    path = '/search/authors'
-    encoding = 'json'
-
-    def GET(self):
-        i = web.input(q='', offset=0, limit=100, fields='*', sort='')
-        offset = safeint(i.offset, 0)
-        limit = safeint(i.limit, 100)
-        limit = min(1000, limit)  # limit limit to 1000.
-
-        response = self.get_results(
-            i.q,
-            query_label='AUTHOR_SEARCH_API',
-            offset=offset,
-            limit=limit,
-            fields=i.fields,
-            sort=i.sort,
-        )
-        raw_resp = response.raw_resp['response']
-        for doc in raw_resp['docs']:
-            # SIGH the public API exposes the key like this :(
-            doc['key'] = doc['key'].split('/')[-1]
-        web.header('Content-Type', 'application/json')
-        return delegate.RawText(json.dumps(raw_resp))
 
 
 @public
@@ -934,21 +1036,28 @@ def rewrite_list_query(q, page, offset, limit):
     """
     from openlibrary.core.lists.model import List
 
-    def cached_get_list_book_keys(key, offset, limit):
+    def cached_get_list_book_keys(key: str, offset: int | None, limit: int | None):
+        offset = offset or 0
+        limit = limit or 100
+
         # make cacheable
         if 'env' not in web.ctx:
             delegate.fakeload()
         lst = cast(List, web.ctx.site.get(key))
-        return list(itertools.islice(lst.get_work_keys(), offset or 0, offset + limit))
+        return list(itertools.islice(lst.get_work_keys(), offset, offset + limit))
 
-    if '/lists/' in q:
+    if list_key_match := re.match(r'^(/people/[^/]+)?/lists/OL\d+L', q):
         # we're making an assumption that q is just a list key
         book_keys = cache.memcache_memoize(
             cached_get_list_book_keys, "search.list_books_query", timeout=5 * 60
-        )(q, offset, limit)
+        )(list_key_match.group(0), offset, limit)
 
         # Compose a query for book_keys or fallback special query w/ no results
-        q = f"key:({' OR '.join(book_keys)})" if book_keys else "-key:*"
+        q = re.sub(
+            r'^(/people/[^/]+)?/lists/OL\d+L',
+            f"key:({' OR '.join(book_keys)})" if book_keys else "-key:*",
+            q,
+        )
 
         # We've applied the offset to fetching get_list_editions to
         # produce the right set of discrete work IDs. We don't want
@@ -958,6 +1067,70 @@ def rewrite_list_query(q, page, offset, limit):
     return q, page, offset, limit
 
 
+@dataclass(frozen=True)
+class PreparedQuery:
+    """A container for a query that has been prepared for Solr."""
+
+    query: dict
+    page: int
+    offset: int
+    limit: int
+
+
+def _process_solr_search_response(response: SearchResponse, fields: str) -> dict:
+    """
+    Handles the post-processing of the Solr response, which is common
+    to both sync and async versions.
+    """
+    processed_response = response.raw_resp['response']
+
+    if response.highlighting is not None:
+        processed_response['highlighting'] = response.highlighting
+
+    # For backward compatibility
+    processed_response['num_found'] = processed_response['numFound']
+
+    if fields == '*' or 'availability' in fields:
+        docs_for_availability = [
+            (
+                work['editions']['docs'][0]
+                if work.get('editions', {}).get('docs')
+                else work
+            )
+            for work in processed_response.get('docs', [])
+        ]
+        add_availability(docs_for_availability)
+
+    return processed_response
+
+
+def _prepare_work_search_query(
+    query: dict, page: int, offset: int, limit: int
+) -> PreparedQuery:
+    """
+    Prepares the query by making a deep copy and rewriting list queries,
+    returning a structured dataclass.
+    """
+    # Ensure we don't mutate the `query` passed in by reference
+    prepared_query_dict = copy.deepcopy(query)
+    prepared_query_dict['wt'] = 'json'
+
+    # Deal with special /lists/ key queries
+    q_val, new_page, new_offset, new_limit = rewrite_list_query(
+        prepared_query_dict.get('q', ''), page, offset, limit
+    )
+    prepared_query_dict['q'] = q_val
+
+    return PreparedQuery(
+        query=prepared_query_dict,
+        page=new_page,
+        offset=new_offset,
+        limit=new_limit,
+    )
+
+
+# Note: these could share an "implementation" to keep a common interface but it creates a lot more complexity
+# Warning: when changing this please also change the async version
 @public
 def work_search(
     query: dict,
@@ -967,115 +1140,74 @@ def work_search(
     limit: int = 100,
     fields: str = '*',
     facet: bool = True,
+    highlight: bool = False,
     spellcheck_count: int | None = None,
-    query_label: QueryLabel = 'UNLABELLED',
+    request_label: SolrRequestLabel = 'UNLABELLED',
 ) -> dict:
-    """
-    :param sort: key of SORTS dict at the top of this file
-    """
-    # Ensure we don't mutate the `query` passed in by reference
-    query = copy.deepcopy(query)
-    query['wt'] = 'json'
+    prepared = _prepare_work_search_query(query, page, offset, limit)
 
-    # deal with special /lists/ key queries
-    query['q'], page, offset, limit = rewrite_list_query(
-        query['q'], page, offset, limit
-    )
     resp = run_solr_query(
         WorkSearchScheme(),
-        query,
-        rows=limit,
-        page=page,
+        prepared.query,
+        rows=prepared.limit,
+        page=prepared.page,
         sort=sort,
-        offset=offset,
+        offset=prepared.offset,
+        fields=fields,
+        facet=facet,
+        highlight=highlight,
+        spellcheck_count=spellcheck_count,
+        request_label=request_label,
+    )
+
+    return _process_solr_search_response(resp, fields)
+
+
+# Warning: when changing this please also change the sync version
+@public
+async def work_search_async(
+    query: dict,
+    sort: str | None = None,
+    page: int = 1,
+    offset: int = 0,
+    limit: int = 100,
+    fields: str | list[str] = '*',
+    facet: bool = True,
+    spellcheck_count: int | None = None,
+    request_label: SolrRequestLabel = 'UNLABELLED',
+    lang: str | None = None,
+    solr_internals_params: 'SolrInternalsParams | None' = None,
+) -> dict:
+    prepared = _prepare_work_search_query(query, page, offset, limit)
+    scheme = WorkSearchScheme(lang=lang)
+    resp = await run_solr_query_async(
+        scheme,
+        prepared.query,
+        rows=prepared.limit,
+        page=prepared.page,
+        sort=sort,
+        offset=prepared.offset,
         fields=fields,
         facet=facet,
         spellcheck_count=spellcheck_count,
-        query_label=query_label,
+        request_label=request_label,
+        solr_internals_params=solr_internals_params,
     )
-    response = resp.raw_resp['response']
 
-    # backward compatibility
-    response['num_found'] = response['numFound']
-    if fields == '*' or 'availability' in fields:
-        add_availability(
-            [
-                (
-                    work['editions']['docs'][0]
-                    if work.get('editions', {}).get('docs')
-                    else work
-                )
-                for work in response['docs']
-            ]
-        )
-    return response
+    return _process_solr_search_response(resp, fields)
 
 
-class search_json(delegate.page):
-    path = "/search"
-    encoding = "json"
+def validate_search_json_query(q: str | None) -> str | None:
+    if q and len(q) < 3:
+        return 'Query too short, must be at least 3 characters'
 
-    def GET(self):
-        i = web.input(
-            author_key=[],
-            subject_facet=[],
-            person_facet=[],
-            place_facet=[],
-            time_facet=[],
-            first_publish_year=[],
-            publisher_facet=[],
-            language=[],
-            public_scan_b=[],
-        )
-        if 'query' in i:
-            query = json.loads(i.query)
-        else:
-            query = i
-
-        sort = query.get('sort', None)
-
-        limit = safeint(query.pop("limit", "100"), default=100)
-        if "offset" in query:
-            offset = safeint(query.pop("offset", 0), default=0)
-            page = None
-        else:
-            offset = None
-            page = safeint(query.pop("page", "1"), default=1)
-
-        fields = WorkSearchScheme.default_fetched_fields
-        if _fields := query.pop('fields', ''):
-            fields = _fields.split(',')
-
-        spellcheck_count = safeint(
-            query.pop("_spellcheck_count", default_spellcheck_count),
-            default=default_spellcheck_count,
+    BLOCKED_QUERIES = {'the'}
+    if q and q.lower() in BLOCKED_QUERIES:
+        return (
+            f"Invalid query; the following queries are not allowed: {', '.join(sorted(BLOCKED_QUERIES))}",
         )
 
-        # If the query is a /list/ key, create custom list_editions_query
-        q = query.get('q', '').strip()
-        query['q'], page, offset, limit = rewrite_list_query(q, page, offset, limit)
-        response = work_search(
-            query,
-            sort=sort,
-            page=page,
-            offset=offset,
-            limit=limit,
-            fields=fields,
-            # We do not support returning facets from /search.json,
-            # so disable it. This makes it much faster.
-            facet=False,
-            spellcheck_count=spellcheck_count,
-            query_label='BOOK_SEARCH_API',
-        )
-        response['documentation_url'] = "https://openlibrary.org/dev/docs/api/search"
-        response['q'] = q
-        response['offset'] = offset
-        # force all other params to appear before `docs` in json
-        docs = response['docs']
-        del response['docs']
-        response['docs'] = docs
-        web.header('Content-Type', 'application/json')
-        return delegate.RawText(json.dumps(response, indent=4))
+    return None
 
 
 def setup():
