@@ -246,6 +246,8 @@ def get_remembered_layout():
     return 'details'
 
 
+# this func currently does not consider our filter queries (fq)
+# therefore we have to add pre-built fq if present in param
 def _prepare_solr_query_params(  # noqa: PLR0912
     scheme: SearchScheme,
     param: dict | None = None,
@@ -322,6 +324,13 @@ def _prepare_solr_query_params(  # noqa: PLR0912
         if isinstance(values, str):
             values = [values]
         params += [('fq', f'{field}:"{val}"') for val in values if val]
+
+    if 'fq' in param:
+        fq_list = param['fq']
+        if isinstance(fq_list, list):
+            params += [('fq', fq) for fq in fq_list]
+        elif isinstance(fq_list, str):
+            params.append(('fq', fq_list))
 
     # Many fields in solr use the convention of `*_facet` both
     # as a facet key and as the explicit search query key.
